@@ -7,7 +7,28 @@ import typing
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from voluptuous.error import AllInvalid, AnyInvalid, BooleanInvalid, CoerceInvalid, ContainsInvalid, DateInvalid, DatetimeInvalid, DirInvalid, EmailInvalid, ExactSequenceInvalid, FalseInvalid, FileInvalid, InInvalid, Invalid, LengthInvalid, MatchInvalid, MultipleInvalid, NotEnoughValid, NotInInvalid, PathInvalid, RangeInvalid, TooManyValid, TrueInvalid, TypeInvalid, UrlInvalid
-from voluptuous.schema_builder import Schema, Schemable, message, raises
+from voluptuous.schema_builder import Schema, Schemable, raises
+
+def message(msg: str, cls: typing.Optional[typing.Type[Invalid]]=None):
+    """Decorate a function with a message to be displayed in case of error.
+
+    >>> @message('not an integer')
+    ... def isint(v):
+    ...   return int(v)
+    >>>
+    >>> validate = Schema(isint())
+    >>> with raises(MultipleInvalid, 'not an integer'):
+    ...   validate('a')
+    """
+    def decorator(f):
+        @wraps(f)
+        def check(v, *args, **kwargs):
+            try:
+                return f(v, *args, **kwargs)
+            except (ValueError, TypeError):
+                raise (cls or Invalid)(msg)
+        return check
+    return decorator
 if typing.TYPE_CHECKING:
     from _typeshed import SupportsAllComparisons
 Enum: typing.Union[type, None]
@@ -36,7 +57,13 @@ def truth(f: typing.Callable) -> typing.Callable:
     >>> with raises(MultipleInvalid, 'not a valid value'):
     ...   validate('/notavaliddir')
     """
-    pass
+    def validator(path, data):
+        t = f(data)
+        if not t:
+            raise Invalid('not a valid value', path)
+        return data
+
+    return validator
 
 class Coerce(object):
     """Coerce a value to a type.
@@ -77,7 +104,6 @@ class Coerce(object):
         return 'Coerce(%s, msg=%r)' % (self.type_name, self.msg)
 
 @message('value was not true', cls=TrueInvalid)
-@truth
 def IsTrue(v):
     """Assert that a value is true, in the Python sense.
 
@@ -100,7 +126,7 @@ def IsTrue(v):
     ... except MultipleInvalid as e:
     ...   assert isinstance(e.errors[0], TrueInvalid)
     """
-    pass
+    return bool(v)
 
 @message('value was not false', cls=FalseInvalid)
 def IsFalse(v):
@@ -119,7 +145,7 @@ def IsFalse(v):
     ... except MultipleInvalid as e:
     ...   assert isinstance(e.errors[0], FalseInvalid)
     """
-    pass
+    return not bool(v)
 
 @message('expected boolean', cls=BooleanInvalid)
 def Boolean(v):
@@ -142,7 +168,16 @@ def Boolean(v):
     ... except MultipleInvalid as e:
     ...   assert isinstance(e.errors[0], BooleanInvalid)
     """
-    pass
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        v = v.lower().strip()
+        if v in ('true', '1', 'yes', 'on', 'enable'):
+            return True
+        if v in ('false', '0', 'no', 'off', 'disable'):
+            return False
+        raise BooleanInvalid('expected boolean')
+    return bool(v)
 
 class _WithSubValidators(object):
     """Base class for validators that use sub-validators.
@@ -168,11 +203,19 @@ class _WithSubValidators(object):
         schema.required = old_required
         return self._run
 
+    def _run(self, path, data):
+        """Run the compiled validators."""
+        return self._exec(self._compiled, data)
+
     def __call__(self, v):
         return self._exec((Schema(val) for val in self.validators), v)
 
     def __repr__(self):
         return '%s(%s, msg=%r)' % (self.__class__.__name__, ', '.join((repr(v) for v in self.validators)), self.msg)
+
+    def _exec(self, validators, v):
+        """Execute the validators against the value."""
+        raise NotImplementedError
 
 class Any(_WithSubValidators):
     """Use the first validated value.
@@ -198,6 +241,17 @@ class Any(_WithSubValidators):
     >>> with raises(MultipleInvalid, "Expected 1 2 or 3"):
     ...   validate(4)
     """
+
+    def _exec(self, validators, v):
+        errors = []
+        for validator in validators:
+            try:
+                return validator(v)
+            except Invalid as e:
+                errors.append(e)
+        if len(errors) == 1:
+            raise errors[0]
+        raise AnyInvalid(self.msg or 'no valid value found')
 Or = Any
 
 class Union(_WithSubValidators):
@@ -220,7 +274,62 @@ class Union(_WithSubValidators):
 
     Without the discriminant, the exception would be "extra keys not allowed @ data['b_val']"
     """
+
+    def _exec(self, validators, v):
+        if self.discriminant is None:
+            return Any._exec(self, validators, v)
+        
+        filtered = list(self.discriminant(v, [val.schema for val in validators]))
+        if not filtered:
+            raise AnyInvalid(self.msg or 'no valid value found')
+        
+        errors = []
+        for validator in validators:
+            if validator.schema in filtered:
+                try:
+                    return validator(v)
+                except Invalid as e:
+                    errors.append(e)
+        if len(errors) == 1:
+            raise errors[0]
+        raise AnyInvalid(self.msg or 'no valid value found')
 Switch = Union
+
+class SomeOf(_WithSubValidators):
+    """Value must pass some of the validators.
+
+    :param min_valid: Minimum number of valid values
+    :param max_valid: Maximum number of valid values
+    :param msg: Message to deliver to user if validation fails.
+    :param kwargs: All other keyword arguments are passed to the sub-schema constructors.
+
+    >>> validate = Schema(SomeOf(min_valid=1, validators=[1, 2, 3]))
+    >>> validate(1)
+    1
+    >>> with raises(MultipleInvalid, "value did not pass enough validations"):
+    ...   validate(4)
+    """
+
+    def __init__(self, min_valid=None, max_valid=None, *validators, msg=None, required=False, discriminant=None, **kwargs) -> None:
+        super().__init__(*validators, msg=msg, required=required, discriminant=discriminant, **kwargs)
+        self.min_valid = min_valid
+        self.max_valid = max_valid
+
+    def _exec(self, validators, v):
+        valid = []
+        errors = []
+        for validator in validators:
+            try:
+                valid.append(validator([], v))
+            except Invalid as e:
+                errors.append(e)
+
+        if self.min_valid is not None and len(valid) < self.min_valid:
+            raise NotEnoughValid(self.msg or 'value did not pass enough validations')
+        if self.max_valid is not None and len(valid) > self.max_valid:
+            raise TooManyValid(self.msg or 'value passed too many validations')
+
+        return valid[0] if valid else None
 
 class All(_WithSubValidators):
     """Value must pass all validators.
@@ -234,6 +343,20 @@ class All(_WithSubValidators):
     >>> validate('10')
     10
     """
+
+    def _exec(self, validators, v):
+        value = v
+        errors = []
+        for validator in validators:
+            try:
+                value = validator(value)
+            except Invalid as e:
+                errors.append(e)
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+            raise AllInvalid(self.msg or 'value did not pass all validators')
+        return value
 And = All
 
 class Match(object):
@@ -296,7 +419,7 @@ class Replace(object):
         return 'Replace(%r, %r, msg=%r)' % (self.pattern.pattern, self.substitution, self.msg)
 
 @message('expected an email address', cls=EmailInvalid)
-def Email(v):
+def Email(v=None):
     """Verify that the value is an email address or not.
 
     >>> s = Schema(Email())
@@ -309,10 +432,32 @@ def Email(v):
     >>> s('t@x.com')
     't@x.com'
     """
-    pass
+    def validate_email(path, data):
+        if not isinstance(data, str):
+            raise EmailInvalid('expected an email address', path)
+        
+        if not data or '@' not in data:
+            raise EmailInvalid('expected an email address', path)
+        
+        user_part, domain_part = data.rsplit('@', 1)
+        
+        if not user_part or not domain_part:
+            raise EmailInvalid('expected an email address', path)
+        
+        if not USER_REGEX.match(user_part):
+            raise EmailInvalid('expected an email address', path)
+        
+        if not DOMAIN_REGEX.match(domain_part):
+            raise EmailInvalid('expected an email address', path)
+        
+        return data
+
+    if v is None:
+        return validate_email
+    return validate_email([], v)
 
 @message('expected a fully qualified domain name URL', cls=UrlInvalid)
-def FqdnUrl(v):
+def FqdnUrl(v=None):
     """Verify that the value is a fully qualified domain name URL.
 
     >>> s = Schema(FqdnUrl())
@@ -321,10 +466,29 @@ def FqdnUrl(v):
     >>> s('http://w3.org')
     'http://w3.org'
     """
-    pass
+    def validate_fqdn_url(path, data):
+        if not isinstance(data, str):
+            raise UrlInvalid('expected a fully qualified domain name URL', path)
+
+        try:
+            parsed = urlparse.urlparse(data)
+            if not parsed.scheme or not parsed.netloc:
+                raise UrlInvalid('expected a fully qualified domain name URL', path)
+            if parsed.netloc == 'localhost':
+                raise UrlInvalid('expected a fully qualified domain name URL', path)
+            if not DOMAIN_REGEX.match(parsed.netloc):
+                raise UrlInvalid('expected a fully qualified domain name URL', path)
+        except Exception:
+            raise UrlInvalid('expected a fully qualified domain name URL', path)
+
+        return data
+
+    if v is None:
+        return validate_fqdn_url
+    return validate_fqdn_url([], v)
 
 @message('expected a URL', cls=UrlInvalid)
-def Url(v):
+def Url(v=None):
     """Verify that the value is a URL.
 
     >>> s = Schema(Url())
@@ -333,7 +497,22 @@ def Url(v):
     >>> s('http://w3.org')
     'http://w3.org'
     """
-    pass
+    def validate_url(v):
+        if not isinstance(v, str):
+            raise UrlInvalid('expected a URL')
+
+        try:
+            parsed = urlparse.urlparse(v)
+            if not parsed.scheme or not parsed.netloc:
+                raise UrlInvalid('expected a URL')
+        except Exception:
+            raise UrlInvalid('expected a URL')
+
+        return v
+
+    if v is None:
+        return validate_url
+    return validate_url(v)
 
 @message('Not a file', cls=FileInvalid)
 @truth
@@ -347,7 +526,9 @@ def IsFile(v):
     >>> with raises(FileInvalid, 'Not a file'):
     ...   IsFile()(None)
     """
-    pass
+    if v is None:
+        return False
+    return os.path.isfile(str(v))
 
 @message('Not a directory', cls=DirInvalid)
 @truth
@@ -359,7 +540,9 @@ def IsDir(v):
     >>> with raises(DirInvalid, 'Not a directory'):
     ...   IsDir()(None)
     """
-    pass
+    if v is None:
+        return False
+    return os.path.isdir(str(v))
 
 @message('path does not exist', cls=PathInvalid)
 @truth
@@ -373,7 +556,9 @@ def PathExists(v):
     >>> with raises(PathInvalid, 'Not a Path'):
     ...   PathExists()(None)
     """
-    pass
+    if v is None:
+        return False
+    return os.path.exists(str(v))
 
 def Maybe(validator: Schemable, msg: typing.Optional[str]=None):
     """Validate that the object matches given validator or is None.
@@ -388,7 +573,14 @@ def Maybe(validator: Schemable, msg: typing.Optional[str]=None):
     ...  s("string")
 
     """
-    pass
+    schema = Schema(validator)
+
+    def validate_or_none(v):
+        if v is None:
+            return v
+        return schema(v)
+
+    return validate_or_none
 
 class Range(object):
     """Limit a value to a range.

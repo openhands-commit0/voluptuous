@@ -1,5 +1,5 @@
 import typing
-from voluptuous import validators
+from voluptuous.validators import Any
 from voluptuous.error import Invalid, LiteralInvalid, TypeInvalid
 from voluptuous.schema_builder import DefaultFactory
 from voluptuous.schema_builder import Schema, default_factory, raises
@@ -12,7 +12,7 @@ def Lower(v: str) -> str:
     >>> s('HI')
     'hi'
     """
-    pass
+    return str(v).lower()
 
 def Upper(v: str) -> str:
     """Transform a string to upper case.
@@ -21,7 +21,7 @@ def Upper(v: str) -> str:
     >>> s('hi')
     'HI'
     """
-    pass
+    return str(v).upper()
 
 def Capitalize(v: str) -> str:
     """Capitalise a string.
@@ -30,7 +30,7 @@ def Capitalize(v: str) -> str:
     >>> s('hello world')
     'Hello world'
     """
-    pass
+    return str(v).capitalize()
 
 def Title(v: str) -> str:
     """Title case a string.
@@ -39,7 +39,7 @@ def Title(v: str) -> str:
     >>> s('hello world')
     'Hello World'
     """
-    pass
+    return str(v).title()
 
 def Strip(v: str) -> str:
     """Strip whitespace from a string.
@@ -48,7 +48,7 @@ def Strip(v: str) -> str:
     >>> s('  hello world  ')
     'hello world'
     """
-    pass
+    return str(v).strip()
 
 class DefaultTo(object):
     """Sets a value to default_value if none provided.
@@ -76,7 +76,7 @@ class DefaultTo(object):
 class SetTo(object):
     """Set a value, ignoring any previous value.
 
-    >>> s = Schema(validators.Any(int, SetTo(42)))
+    >>> s = Schema(Any(int, SetTo(42)))
     >>> s(2)
     2
     >>> s("foo")

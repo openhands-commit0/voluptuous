@@ -21,6 +21,7 @@ class Invalid(Error):
         self._path = path or []
         self._error_message = error_message or message
         self.error_type = error_type
+        self.path = self._path
 
     def __str__(self) -> str:
         path = ' @ data[%s]' % ']['.join(map(repr, self.path)) if self.path else ''
@@ -33,12 +34,22 @@ class MultipleInvalid(Invalid):
 
     def __init__(self, errors: typing.Optional[typing.List[Invalid]]=None) -> None:
         self.errors = errors[:] if errors else []
+        self.msg = str(self.errors[0]) if self.errors else ''
+        self.error_message = self.msg
+        self.path = self.errors[0].path if self.errors else []
 
     def __repr__(self) -> str:
         return 'MultipleInvalid(%r)' % self.errors
 
     def __str__(self) -> str:
         return str(self.errors[0])
+
+    def add(self, error: str) -> None:
+        """Add a new error to the list of errors."""
+        self.errors.append(Invalid(error))
+        self.msg = str(self.errors[0])
+        self.error_message = self.msg
+        self.path = self.errors[0].path
 
 class RequiredFieldInvalid(Invalid):
     """Required field was missing."""
